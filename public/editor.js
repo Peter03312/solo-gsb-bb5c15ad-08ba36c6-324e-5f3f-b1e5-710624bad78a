@@ -1169,6 +1169,7 @@ function renderSessionList(sessions) {
       </div>
       ${s.status === 'committed' ? `<div class="muted">已提交：新草稿修订号 ${s.revisionNo}。</div>` : ''}
       ${s.status === 'conflicted' ? `<div class="muted" style="color:#a33">提交因 ${s.conflictCount} 处冲突被拒绝，草稿未改动；请基于最新草稿重开会话。</div>` : ''}
+      ${s.status === 'open' && s.restoredAfterOpen ? `<div class="muted" style="color:#a33">草稿在此期间被「从历史版本恢复」替换过，本会话提交将被拒绝；请开启新会话。</div>` : ''}
     </div>`).join('');
 }
 
@@ -1257,7 +1258,20 @@ function sessionConflictItemHtml(c) {
     field_conflict: '同一字段双方不同值',
     edit_delete: '编辑与删除相撞',
     endpoint_deleted: '关系端点已删除',
+    restore_rebased: '恢复导致对象身份更替',
   }[c.type] || c.type;
+  if (c.type === 'restore_rebased') {
+    const restores = Array.isArray(c.restores) ? c.restores : [];
+    return `
+      <div class="rel-line">
+        <span class="badge" style="background:#fbeaea;color:#a33">${esc(typeLabel)}</span>
+        <div>${esc(c.message)}</div>
+        ${restores.length
+          ? `<div class="muted">期间发生的恢复：${restores.map((r) => `第 ${r.restoreNo} 次（恢复自第 ${r.versionNo} 版，${esc(r.restoredAt)} UTC）`).join('；')}</div>`
+          : ''}
+        <div class="muted">恢复会重排对象编号，基线中的对象与当前草稿的同编号对象已不再是同一对象；请「开启新会话」基于最新草稿重新整理。</div>
+      </div>`;
+  }
   const objLabel = { event: '事件', claim: '主张', relation: '「先于」关系' }[c.objectType] || c.objectType;
   let table;
   if (c.type === 'field_conflict' && Array.isArray(c.fields)) {
@@ -1307,6 +1321,11 @@ function renderSessionDetail() {
 
   if (s.status === 'open') {
     body = `
+      ${s.restoredAfterOpen
+        ? `<div class="alert error">本会话开启后，草稿被「从历史版本恢复」整体替换过：对象编号已重新占用，
+            基线中的对象与当前草稿的同编号对象已不再是同一对象。本会话的提交将被整次拒绝（409），
+            请「开启新会话」基于最新草稿重新整理。</div>`
+        : ''}
       <p class="muted">会话进行中：草稿不加锁，对方可继续编辑。把本轮修改写成操作暂存进来（不直接写草稿），
         完成后点「提交会话」。引用基线中的对象用其 id（见下方工作稿），新建对象用临时编号互相引用。</p>
       <label>暂存操作（JSON 数组，整批校验、整批拒绝）</label>

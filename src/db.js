@@ -257,6 +257,7 @@ CREATE TABLE IF NOT EXISTS edit_sessions (
   editor           TEXT NOT NULL DEFAULT '',
   note             TEXT NOT NULL DEFAULT '',
   base_revision_no INTEGER NOT NULL,                    -- 开启时的草稿修订号
+  base_restore_no  INTEGER NOT NULL DEFAULT 0,          -- 开启时的恢复序号（草稿代，见 draft_restores）
   baseline_json    TEXT NOT NULL,                       -- 开启时的草稿快照（事件/主张/关系）
   status           TEXT NOT NULL DEFAULT 'open'
                      CHECK (status IN ('open','committed','conflicted')),
@@ -274,6 +275,18 @@ CREATE TABLE IF NOT EXISTS edit_session_ops (
   UNIQUE (session_id, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_session_ops_session ON edit_session_ops(session_id);
+
+-- ============ 草稿恢复登记（每次「从历史版本恢复草稿」一行，只追加） ============
+-- 恢复会清空整个草稿区并按版本快照重建、重置自增序号：新草稿里的事件 / 主张 /
+-- 关系编号与恢复前的同编号对象已不再是同一对象（对象身份更替）。本表的最大行号
+-- 即「草稿代」：并行编辑会话开启时记下当时的代数（base_restore_no），提交时若
+-- 代数已变，说明基线被恢复更替过，三方合并不再安全，整次拒绝（409）。
+-- 本表只追加、不回写；不影响恢复接口的编号映射、已发布快照与既有接口契约。
+CREATE TABLE IF NOT EXISTS draft_restores (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,   -- 恢复序号（即草稿代）
+  version_no  INTEGER NOT NULL,                    -- 恢复自哪个已发布版本
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
 `;
 
 let db;
@@ -286,7 +299,16 @@ function getDb() {
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
   db.exec(SCHEMA);
+  migrate(db);
   return db;
+}
+
+// 轻量迁移：为升级前已存在的库补充后加的列（新库已由 SCHEMA 一次建好）。
+function migrate(instance) {
+  const sessionCols = instance.prepare('PRAGMA table_info(edit_sessions)').all();
+  if (!sessionCols.some((c) => c.name === 'base_restore_no')) {
+    instance.exec('ALTER TABLE edit_sessions ADD COLUMN base_restore_no INTEGER NOT NULL DEFAULT 0');
+  }
 }
 
 // 测试时可注入独立数据库

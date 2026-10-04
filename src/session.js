@@ -15,6 +15,10 @@
 //   · 同一字段被双方改成不同值、编辑与删除相撞（含删除会级联丢弃对方新增内容）、
 //     关系端点已被对方删除：整次拒绝（409 SESSION_MERGE_CONFLICT），逐项列出
 //     基线 / 当前值 / 拟提交值供人工重编，草稿一字未动；
+//   · 会话开启后草稿被「从历史版本恢复」整体替换过（恢复会重排对象编号，基线中的
+//     对象与当前草稿的同编号对象已不再是同一对象）：同样整次拒绝
+//     （409 SESSION_MERGE_CONFLICT，冲突类型 restore_rebased），草稿一字未动——
+//     否则按编号对齐的三方合并会把旧对象的改动写进占用同一编号的新对象；
 //   · 无冲突：在一个事务内应用全部变更（草稿修订号只推进一次），返回新修订号
 //     与临时编号 → 正式编号映射。
 // 提交幂等：会话一旦 committed / conflicted 即关闭，重复提交返回首次结果，
@@ -23,7 +27,7 @@
 
 const { getDb } = require('./db');
 const { parseClaimDate, claimInterval, formatClaimDate } = require('./dates');
-const { draftRevisionNo } = require('./restore');
+const { draftRevisionNo, draftRestoreNo } = require('./restore');
 
 const EVENT_FIELDS = ['title', 'description'];
 const CLAIM_FIELDS = ['precision', 'year', 'month', 'day', 'source', 'note'];
@@ -808,14 +812,15 @@ function getSessionRow(sessionId) {
   return getDb().prepare('SELECT * FROM edit_sessions WHERE id = ?').get(sessionId);
 }
 
-// 开启会话：记录当前草稿修订号与完整草稿快照（基线，只读）。
+// 开启会话：记录当前草稿修订号、恢复序号（草稿代）与完整草稿快照（基线，只读）。
 function openSession({ editor, note }) {
   const db = getDb();
   const baseline = readDraftState();
   const baseRevisionNo = draftRevisionNo();
+  const baseRestoreNo = draftRestoreNo();
   const info = db
-    .prepare('INSERT INTO edit_sessions (editor, note, base_revision_no, baseline_json) VALUES (?, ?, ?, ?)')
-    .run(String(editor || ''), String(note || ''), baseRevisionNo, JSON.stringify(baseline));
+    .prepare('INSERT INTO edit_sessions (editor, note, base_revision_no, base_restore_no, baseline_json) VALUES (?, ?, ?, ?, ?)')
+    .run(String(editor || ''), String(note || ''), baseRevisionNo, baseRestoreNo, JSON.stringify(baseline));
   return getSession(info.lastInsertRowid);
 }
 
@@ -831,7 +836,10 @@ function getSession(sessionId) {
     note: row.note,
     status: row.status,
     baseRevisionNo: row.base_revision_no,
+    baseRestoreNo: row.base_restore_no,
     currentRevisionNo: draftRevisionNo(),
+    // 开启后草稿被恢复过：基线对象身份已更替，本会话提交将被整次拒绝
+    restoredAfterOpen: draftRestoreNo() !== row.base_restore_no,
     openedAt: row.created_at,
     closedAt: row.closed_at,
     baseline: shapeState(workingFromState(baseline)),
@@ -842,10 +850,12 @@ function getSession(sessionId) {
 }
 
 function listSessions() {
+  const restoreNo = draftRestoreNo();
   return getDb()
     .prepare(
       `SELECT s.id AS sessionId, s.editor, s.note, s.status,
-              s.base_revision_no AS baseRevisionNo, s.created_at AS openedAt, s.closed_at AS closedAt,
+              s.base_revision_no AS baseRevisionNo, s.base_restore_no AS baseRestoreNo,
+              s.created_at AS openedAt, s.closed_at AS closedAt,
               (SELECT COUNT(*) FROM edit_session_ops o WHERE o.session_id = s.id) AS opCount,
               s.result_json AS resultJson
          FROM edit_sessions s ORDER BY s.id DESC`
@@ -859,6 +869,7 @@ function listSessions() {
         note: r.note,
         status: r.status,
         baseRevisionNo: r.baseRevisionNo,
+        restoredAfterOpen: restoreNo !== r.baseRestoreNo,
         opCount: r.opCount,
         openedAt: r.openedAt,
         closedAt: r.closedAt,
@@ -919,6 +930,8 @@ function appendSessionOps(sessionId, rawOps) {
 }
 
 // 提交会话：三方合并 → 无冲突则一个事务应用全部变更；有冲突整次拒绝并逐项列出。
+// 会话开启后若草稿被「从历史版本恢复」替换过（草稿代已变），基线对象身份已更替，
+// 同样整次拒绝（冲突类型 restore_rebased）——不做按编号对齐的三方合并。
 // 幂等：会话关闭后重复提交返回首次结果，绝不重复写入。
 function commitSession(sessionId) {
   const db = getDb();
@@ -938,6 +951,53 @@ function commitSession(sessionId) {
       sessionId,
       message: `编辑会话 #${sessionId} 此前的提交已因冲突被拒绝（会话已关闭，草稿未改动）。请基于最新草稿重开会话后重新暂存并提交。`,
       ...result,
+    };
+  }
+
+  // 恢复识别：开启后草稿被「从历史版本恢复」整体替换过时，恢复会清空草稿并按
+  // 版本快照重建、重排全部对象编号——基线中的对象与当前草稿的同编号对象已不再
+  // 是同一对象，按编号对齐的三方合并会把旧对象的改动写进占用同一编号的新对象。
+  // 因此整次拒绝（草稿一字未动），须基于最新草稿重开会话。
+  const currentRestoreNo = draftRestoreNo();
+  if (currentRestoreNo !== row.base_restore_no) {
+    const restores = db
+      .prepare(
+        `SELECT id AS restoreNo, version_no AS versionNo, created_at AS restoredAt
+           FROM draft_restores WHERE id > ? ORDER BY id`
+      )
+      .all(row.base_restore_no);
+    const restoreList = restores.map((r) => `第 ${r.restoreNo} 次（恢复自第 ${r.versionNo} 版，${r.restoredAt} UTC）`).join('；');
+    const conflicts = [
+      {
+        type: 'restore_rebased',
+        message:
+          `会话开启后草稿被「从历史版本恢复」整体替换过 ${restores.length} 次（${restoreList}）：` +
+          `恢复清空草稿并按版本快照重建，事件 / 主张 / 关系的编号被重新占用，` +
+          `基线中的对象与当前草稿中的同编号对象已不再是同一对象，无法安全三方合并`,
+        restores,
+        baseline: null,
+        current: null,
+        proposed: null,
+      },
+    ];
+    const stored = {
+      baseRevisionNo: row.base_revision_no,
+      currentRevisionNo: draftRevisionNo(),
+      conflicts,
+    };
+    db.prepare("UPDATE edit_sessions SET status = 'conflicted', result_json = ?, closed_at = datetime('now') WHERE id = ?").run(
+      JSON.stringify(stored),
+      sessionId
+    );
+    throw {
+      status: 409,
+      code: 'SESSION_MERGE_CONFLICT',
+      sessionId,
+      message:
+        `编辑会话 #${sessionId} 提交被拒绝：会话开启后草稿被「从历史版本恢复」整体替换过，` +
+        `对象编号已重新占用，基线对象身份已更替（冲突类型 restore_rebased）。` +
+        `草稿未做任何改动，请基于最新草稿重开会话后重新暂存并提交。`,
+      ...stored,
     };
   }
 

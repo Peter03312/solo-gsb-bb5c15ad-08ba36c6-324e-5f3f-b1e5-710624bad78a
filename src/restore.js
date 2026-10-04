@@ -9,7 +9,9 @@
 //   1. 校验版本仍存在、最新版本号与预览时一致、草稿修订号与预览时一致；
 //   2. 清空整个草稿区（按依赖顺序显式删除 relations / claims / events）；
 //   3. 按版本快照重建事件、关系；每事件只复制当版被选的那一条主张；
-//   4. 重置自增序号，使新草稿 id 从 1 开始。
+//   4. 重置自增序号，使新草稿 id 从 1 开始；
+//   5. 在 draft_restores 追加一行恢复登记（草稿代 +1），开启中的并行编辑会话
+//      据此识别基线对象身份已被恢复更替。
 // 历史版本快照（versions / version_events / version_relations）不动，
 // 访客年表因此保持不变。
 
@@ -19,6 +21,12 @@ const { getVersionDetail, latestVersionNo } = require('./publish');
 
 function draftRevisionNo() {
   return getDb().prepare('SELECT revision FROM draft_meta WHERE id = 1').get().revision;
+}
+
+// 当前「草稿代」：已确认恢复的次数（draft_restores 最大行号）。
+// 恢复会整体替换草稿并重排对象编号；并行编辑会话以此识别基线对象身份是否已更替。
+function draftRestoreNo() {
+  return getDb().prepare('SELECT COALESCE(MAX(id), 0) AS n FROM draft_restores').get().n;
 }
 
 function draftEventApi(row) {
@@ -194,6 +202,10 @@ function restoreDraftFromVersion({ versionNo, expectedRevision, expectedLatestVe
     // 只应算一次草稿变更，最终把修订号校正为预览时的值 + 1。
     db.prepare('UPDATE draft_meta SET revision = ? WHERE id = 1').run(Number(expectedRevision) + 1);
 
+    // 登记本次恢复（只追加）：恢复重排了对象编号，开启中的并行编辑会话据此
+    // 识别基线对象身份已更替，提交时整次拒绝而不是把改动合并到同编号的新对象上。
+    db.prepare('INSERT INTO draft_restores (version_no) VALUES (?)').run(versionNo);
+
     return { eventMap, relationMap };
   });
 
@@ -220,4 +232,5 @@ module.exports = {
   buildRestorePreview,
   restoreDraftFromVersion,
   draftRevisionNo,
+  draftRestoreNo,
 };
