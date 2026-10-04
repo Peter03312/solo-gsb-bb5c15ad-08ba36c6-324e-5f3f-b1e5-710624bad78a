@@ -9,7 +9,9 @@
 //   1. 校验版本仍存在、最新版本号与预览时一致、草稿修订号与预览时一致；
 //   2. 清空整个草稿区（按依赖顺序显式删除 relations / claims / events）；
 //   3. 按版本快照重建事件、关系；每事件只复制当版被选的那一条主张；
-//   4. 重置自增序号，使新草稿 id 从 1 开始。
+//   4. 重置自增序号，使新草稿 id 从 1 开始；
+//   5. 推进草稿「身份代次」（restore_epoch）：编号已重新分配，跨此次恢复仍
+//      未关闭的编辑会话提交时将按身份更替冲突整次拒绝（409 SESSION_MERGE_CONFLICT）。
 // 历史版本快照（versions / version_events / version_relations）不动，
 // 访客年表因此保持不变。
 
@@ -19,6 +21,12 @@ const { getVersionDetail, latestVersionNo } = require('./publish');
 
 function draftRevisionNo() {
   return getDb().prepare('SELECT revision FROM draft_meta WHERE id = 1').get().revision;
+}
+
+// 草稿「身份代次」：每次「从版本恢复草稿」（清空重建、编号从 1 重新分配）+1；
+// 普通增删改不动。开启中的旧会话提交时若发现代次已变，即按身份更替冲突整次拒绝。
+function draftRestoreEpoch() {
+  return getDb().prepare('SELECT restore_epoch FROM draft_meta WHERE id = 1').get().restore_epoch;
 }
 
 function draftEventApi(row) {
@@ -194,6 +202,12 @@ function restoreDraftFromVersion({ versionNo, expectedRevision, expectedLatestVe
     // 只应算一次草稿变更，最终把修订号校正为预览时的值 + 1。
     db.prepare('UPDATE draft_meta SET revision = ? WHERE id = 1').run(Number(expectedRevision) + 1);
 
+    // 恢复会清空重建整个草稿区并重置自增序号——编号可能重新分配给不同对象，
+    // 因此推进「身份代次」，使基线属于旧代次的未关闭会话提交时整次拒绝。
+    db.prepare('UPDATE draft_meta SET restore_epoch = restore_epoch + 1, last_restore_version_no = ? WHERE id = 1').run(
+      versionNo
+    );
+
     return { eventMap, relationMap };
   });
 
@@ -220,4 +234,5 @@ module.exports = {
   buildRestorePreview,
   restoreDraftFromVersion,
   draftRevisionNo,
+  draftRestoreEpoch,
 };

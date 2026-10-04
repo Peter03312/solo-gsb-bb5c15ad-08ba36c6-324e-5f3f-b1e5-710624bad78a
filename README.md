@@ -136,7 +136,7 @@ curl -s -X DELETE -H "X-Editor-Token: $TOKEN" "$BASE/api/editor/schedules/1"  # 
    - 新草稿修订号（每次恢复只推进一次修订号）。
 3. **冲突保护**：确认前若草稿被任何人增删改过（修订号变化），或期间发布了更新的版本（最新版本号变化），返回 **409**（`DRAFT_REVISION_CONFLICT` / `VERSION_CONFLICT`）且**不改动任何数据**，需重新预览再确认；目标版本不存在返回 404。
 
-草稿的任何增、删、改都会推进草稿修订号（含恢复本身）。恢复后：
+草稿的任何增、删、改都会推进草稿修订号（含恢复本身）。恢复还会推进草稿**身份代次**（`restoreEpoch`，见「并行编辑会话」一节）：因为恢复会清空草稿并把编号从 1 重新分配，**跨越本次恢复仍未关闭的编辑会话，提交时一律整次拒绝**（409 `SESSION_MERGE_CONFLICT`，冲突项 `type:"identity_replaced"`），避免把旧编号对象的改动错误写进占用了同一编号的新对象。恢复后：
 
 - **历史快照与访客年表保持不变**（访客仍看当前最新发布版）；
 - 草稿仅含该版内容，仍需「校验能否发布」后正式发布才会公开；
@@ -419,16 +419,18 @@ curl -s -H "X-Editor-Token: $TOKEN" \
 
 两名编辑者需要**同时整理同一份草稿**（不止发布时刻冲突）时，可在工作台「并行编辑会话」卡片各自**开启编辑会话**，或直接调用 HTTP API：
 
-- **开启即快照**：开启会话时记录当时的**草稿修订号**与全部事件 / 时间主张 / 「先于」关系（**基线，只读不变**）。草稿**不加锁**，对方可继续直接编辑或开自己的会话。
+- **开启即快照**：开启会话时记录当时的**草稿修订号**、草稿**身份代次**（`baseRestoreEpoch`）与全部事件 / 时间主张 / 「先于」关系（**基线，只读不变**）。草稿**不加锁**，对方可继续直接编辑或开自己的会话。
 - **会话内修改先暂存**：修改写成一批**操作**（`create_event` / `update_event` / `delete_event` / `create_claim` / `update_claim` / `delete_claim` / `create_relation` / `update_relation` / `delete_relation`）暂存进会话，**不直接写草稿**。新建对象用会话内**临时编号**（`tempId`）互相引用（`eventRef` / `earlierRef` / `laterRef` 等）；引用基线中的对象用其正式 id。暂存沿用现有的主张日期、出处（必填）、关系（禁止自环、端点须存在）校验，**整批校验、有问题整批拒绝**（422，逐条列出）。
 - **提交时三方合并**：对照**会话基线**、**当前草稿**、**会话工作稿**（基线 + 暂存操作）逐项合并——
   - 彼此未触及的对象或字段**自动合并**（对方改标题、你改描述，两个改动都保留；对方新增 / 删除的对象原样保留），**不覆盖另一人的改动**；
   - 以下情况**整次拒绝**（409 `SESSION_MERGE_CONFLICT`），**逐项列出基线、当前值和拟提交值**供人工重编，草稿一字未动：
     1. **同一字段被双方改成不同值**（逐字段列出三方值）；
     2. **编辑与删除相撞**（你改它删 / 你删它改，含你的删除会级联丢弃对方在该事件上新增的主张或关系）；
-    3. **关系端点已删除**（会话新增 / 保留的关系或主张引用了对方已删除的事件）。
+    3. **关系端点已删除**（会话新增 / 保留的关系或主张引用了对方已删除的事件）；
+    4. **恢复造成的对象身份更替**（会话开启后草稿被「从已发布版本恢复」整体重建）。恢复会清空草稿、重置自增序号，编号从 1 重新分配给可能完全不同的对象（例如基线里 #1 是事件 A，对方删除 A、创建 B 后发布并从该版恢复，**B 会重新占用编号 1**）；此时按编号对齐的三方合并已不安全（旧会话只改 A 的描述可能被错误写进 B），故**跨恢复的未关闭会话整次拒绝**，冲突项为 `{type:"identity_replaced", reason:"draft_restored", baseRestoreEpoch, currentRestoreEpoch, restoredFromVersionNo, message}`。会话详情 / 列表中的 `restoreCrossed` 为 `true` 即表示该会话基线已跨越恢复。
 - **成功提交原子应用**：全部变更在**一个事务**内写入（草稿修订号只推进一次），返回**新草稿修订号**与**临时编号 → 正式编号映射**（事件 / 主张 / 关系），以及双方改了不同字段的自动合并清单。
-- **幂等与冲突后重开**：会话提交后随即关闭（`committed` / `conflicted` 均为终态）。**重试同一提交返回首次结果，绝不重复写入**；冲突的会话不能再提交，须**基于最新草稿重开会话**（新会话的基线即包含对方的最新改动）人工重编后再提交。
+- **身份代次（restoreEpoch）语义**：`GET /api/editor/state` 与会话列表附当前 `draftRestoreEpoch`；**普通并行编辑（增删改、会话提交）不推进代次**，因此同代次内永远走上面的常规三方合并；只有「从版本恢复草稿」会把代次 +1。已关闭会话（无论 committed 还是 conflicted）的重复提交始终返回首次结果，与之后是否又发生恢复无关。
+- **幂等与冲突后重开**：会话提交后随即关闭（`committed` / `conflicted` 均为终态）。**重试同一提交返回首次结果，绝不重复写入**；冲突（含身份更替）的会话不能再提交，须**基于最新草稿重开会话**（新会话的基线即恢复后的草稿、代次已对齐；恢复响应中的旧→新 `idMap` 可帮助核对编号）人工重编后再提交。
 - **与现有规则共存**：会话提交只是改写草稿，发布与预约发布的校验、`baseVersionNo` 版本冲突规则、出处遮盖、版本撤回等完全不变。**会话内容只在 `/api/editor` 下暴露（持编辑口令），访客不可见。**
 
 ```bash
@@ -475,11 +477,22 @@ curl -s -X POST "$BASE/api/editor/sessions/2/commit" -H "X-Editor-Token: $TOKEN"
 #    其它冲突类型：edit_delete（编辑与删除相撞）、endpoint_deleted（关系端点已删除）。
 #    草稿未做任何改动；须重开会话（基线即最新草稿）人工重编后再提交。
 
+# 6) 恢复造成的对象身份更替：会话 #3 开启后，另一人删除其基线对象、发布并从该版恢复，
+#    恢复重置编号（新对象重新占用 #1）。旧会话再提交整次拒绝，绝不把旧 #1 的改动写进新 #1：
+curl -s -X POST "$BASE/api/editor/sessions/3/commit" -H "X-Editor-Token: $TOKEN"
+# => 409 {"code":"SESSION_MERGE_CONFLICT","baseRestoreEpoch":0,"currentRestoreEpoch":1,
+#        "conflicts":[{"type":"identity_replaced","reason":"draft_restored",
+#          "restoredFromVersionNo":1,
+#          "message":"草稿在会话开启后被「从已发布版本恢复」整体重建（身份代次 0 → 1…）…"}]}
+#    重复提交同样 409 且 alreadyConflicted:true；基于恢复后的草稿重开会话即可继续。
+#    state / 会话列表另附 draftRestoreEpoch，列表项 restoreCrossed:true 标识跨越恢复的会话。
+
+curl -s -H "X-Editor-Token: $TOKEN" "$BASE/api/editor/state"            # 含 draftRestoreEpoch
 curl -s -H "X-Editor-Token: $TOKEN" "$BASE/api/editor/sessions"      # 会话列表
 curl -s -H "X-Editor-Token: $TOKEN" "$BASE/api/editor/sessions/1"    # 会话详情（基线/操作/工作稿/结果）
 ```
 
-完整可运行的端到端示例见 `examples/session-example.sh`（两人并行、自动合并、三类冲突逐项明细、幂等重试、冲突后重开会话、访客不可见，约 5 秒）。
+完整可运行的端到端示例见 `examples/session-example.sh`（两人并行、自动合并、三类冲突逐项明细、幂等重试、冲突后重开会话、访客不可见，约 5 秒）。「删除 A→发布→从该版恢复→B 占用编号 1→旧会话提交被 identity_replaced 整次拒绝→重开会话后自动合并」的完整链路见 `examples/session-restore-example.sh`。
 
 ### 访客（http://localhost:3000/）
 
@@ -500,7 +513,7 @@ curl -s -H "X-Editor-Token: $TOKEN" "$BASE/api/editor/sessions/1"    # 会话详
 - 勘误附记表 `errata` 只追加：目标版号、对象类型（event / relation）、该版快照对象编号、勘误说明、出处、编辑者、被替代的前一条附记号（`replaces_errata_id`，NULL 为该目标首条）。**不回写快照或草稿**；同一目标的生效附记即链尾（id 最大者），替代时事务内核对所见附记号，冲突不落库；旧附记全部保留供追溯。公开读出时附记出处按 `source_redactions` 精确文本动态遮盖；目标版撤回后访客不再看到该版及其附记。
 - 预约发布表 `publish_schedules` 在建立时冻结完整待发布内容（事件 / 所选主张 / 关系 / 求解日期）与基准版本号；`status` 在待执行（`pending`）、已发布（`published`）、冲突（`conflict`）、已取消（`cancelled`）间单向流转。到期写版本与翻状态在同一事务内完成，重启只补跑 `pending` 行；**冻结基准版已被撤回的预约到期转冲突，不生成新版本**。
 - 脉络路线表 `routes / route_anchors / route_segments` 同样只追加：建立时冻结所据版本号、锚点顺序与每段见证链（事件 id 序列与关系 id 序列），展示字段读自该版不可变快照，因此改草稿、恢复草稿、发新版都不影响旧路线。
-- 并行编辑会话表 `edit_sessions / edit_session_ops`：开启会话时把当时的草稿修订号与完整草稿快照写入 `baseline_json`（基线只读）；会话内的修改按操作逐条暂存于 `edit_session_ops`（不触碰草稿区，也不推进草稿修订号）。提交时三方合并的结果（新修订号与编号映射，或冲突明细）存回 `result_json`，会话随即关闭（`committed` / `conflicted` 终态），重复提交直接返回该结果、绝不重复写入。
+- 并行编辑会话表 `edit_sessions / edit_session_ops`：开启会话时把当时的草稿修订号、草稿身份代次（`base_restore_epoch`）与完整草稿快照写入 `baseline_json`（基线只读）；会话内的修改按操作逐条暂存于 `edit_session_ops`（不触碰草稿区，也不推进草稿修订号）。提交时先核对身份代次（会话开启后若发生过「从版本恢复」即按 `identity_replaced` 整次拒绝），再做三方合并；合并结果（新修订号与编号映射，或冲突明细）存回 `result_json`，会话随即关闭（`committed` / `conflicted` 终态），重复提交直接返回该结果、绝不重复写入。身份代次存于 `draft_meta.restore_epoch`，普通增删改不动，仅恢复事务内 +1；老库缺列时启动自动幂等补列（默认 0 = 从未恢复）。
 
 ## 目录结构
 
@@ -512,7 +525,8 @@ src/
   dates.js      年/月/日精度 → 覆盖区间（公历序数日）
   solver.js     Tarjan 环检测 + 拓扑下界传播求严格先后可行解
   publish.js    发布事务：再校验 + 版本冲突检查 + 写不可变快照
-  restore.js    恢复草稿：只读预览 + 原子替换事务（修订号/版本号冲突检查、按快照重建）
+  restore.js    恢复草稿：只读预览 + 原子替换事务（修订号/版本号冲突检查、按快照重建、
+                重置自增编号并推进草稿身份代次 restore_epoch，使跨恢复的旧会话整次拒绝）
   bundle.js     采访整理包导入：整包校验 + 内容指纹 + 只读预览 + 事务追加（批次防重/修订号冲突检查）
   redact.js     出处遮盖：精确出处文本的只读命中预览 + 只追加登记（版本号冲突检查）；公开读出层动态替换为「出处已遮盖」
   retract.js    版本撤回：按版本号 + 非空原因只追加审计记录（快照/版本号不变，重复撤回幂等返回首次记录）；公开读出层隐藏撤回版（最新年表指向最大未撤回版，撤回版详情与引用它的路线按不存在处理）
@@ -523,14 +537,15 @@ src/
   schedule.js   预约发布：建立时冻结快照/基准版本号；到期按时间、预约号顺序逐条事务执行（发布或标冲突，幂等不重发不留半版；基准版已撤回 → 冲突）；查看/取消
   scheduler.js  预约调度器：每秒检查到期预约，服务启动立即补跑（重启安全）
   route.js      专题脉络路线：锚点校验 + 分层 BFS 求最少关系见证链（同长度按关系 ID 序列择小）+ 冻结落库；公开读出层动态遮盖出处
-  session.js    并行编辑会话：开启时快照基线（草稿修订号 + 事件/主张/关系）；操作暂存（整批校验）；
-                提交时三方合并（基线/当前草稿/会话工作稿）——未触及的对象与字段自动合并，
+  session.js    并行编辑会话：开启时快照基线（草稿修订号 + 身份代次 + 事件/主张/关系）；操作暂存（整批校验）；
+                提交时先核对身份代次（跨恢复 → identity_replaced 整次拒绝），再做三方合并
+                （基线/当前草稿/会话工作稿）——未触及的对象与字段自动合并，
                 同字段双改/编辑删除相撞/关系端点已删除整次拒绝并逐项列出三方值；
                 成功提交事务内原子应用（修订号只推进一次）并返回临时编号映射，重复提交幂等
   seed.js       演示数据
 public/         访客页与编辑台（原生 HTML/CSS/JS）
-examples/       采访整理包 JSON 示例；出处遮盖、预约发布、脉络路线、版本撤回、勘误附记、并行编辑会话 curl 调用示例
-test/           node:test 单元与端到端测试（含成环、无解、409 冲突、草稿恢复、整理包导入、出处遮盖、预约发布/重启补跑、脉络路线、版本撤回、勘误附记替代与并发冲突、并行编辑会话三方合并）
+examples/       采访整理包 JSON 示例；出处遮盖、预约发布、脉络路线、版本撤回、勘误附记、并行编辑会话、跨恢复身份冲突 curl 调用示例
+test/           node:test 单元与端到端测试（含成环、无解、409 冲突、草稿恢复、整理包导入、出处遮盖、预约发布/重启补跑、脉络路线、版本撤回、勘误附记替代与并发冲突、并行编辑会话三方合并、跨恢复对象身份更替）
 ```
 
 ## 主要 HTTP API
@@ -543,7 +558,7 @@ test/           node:test 单元与端到端测试（含成环、无解、409 �
 
 编辑（需请求头 `X-Editor-Token`）：
 
-- `GET  /api/editor/state` — 草稿全貌 + 当前版本号（最高已发布版本号，含撤回版）+ 访客可见最新版号 `latestVisibleVersionNo` + 草稿修订号 `draftRevisionNo`
+- `GET  /api/editor/state` — 草稿全貌 + 当前版本号（最高已发布版本号，含撤回版）+ 访客可见最新版号 `latestVisibleVersionNo` + 草稿修订号 `draftRevisionNo` + 草稿身份代次 `draftRestoreEpoch`（仅「从版本恢复」推进）
 - 事件：`POST /api/editor/events`、`PUT/DELETE /api/editor/events/:id`
 - 主张：`POST /api/editor/events/:id/claims`、`PUT/DELETE /api/editor/claims/:claimId`
 - 关系：`POST /api/editor/relations`、`DELETE /api/editor/relations/:id`
@@ -590,13 +605,17 @@ test/           node:test 单元与端到端测试（含成环、无解、409 �
   - 400：标题为空 / 锚点不足两个 / 事件 id 非整数 / 重复事件（`ROUTE_DUPLICATE_EVENTS`）；404：版本不存在；422：`{code:"ROUTE_INVALID", errors:[{type:"unknown_event"|"disconnected", segmentIndex, eventIds, message}]}`（未知事件或断点一次性列出）；均不保存
 - `GET  /api/editor/routes` — 路线清单（含锚点数 / 段数 / 所据版本；每项附 `versionRetracted` 标记所据版本已撤回）
 - `GET  /api/editor/routes/:no/raw` — 路线详情**原文**（持编辑口令，不应用遮盖；引用撤回版的路线仍可见，响应附 `versionRetracted`）；不存在 404
-- `POST /api/editor/sessions` — 开启并行编辑会话；体含 `editor`、`note`。记录当时**草稿修订号**与事件 / 主张 / 关系快照（基线，只读）
-  - 201：`{session:{sessionId, status:"open", baseRevisionNo, currentRevisionNo, openedAt, baseline:{events,relations,counts}, ops:[], working, result:null}}`
-- `GET  /api/editor/sessions` — 会话列表（状态 / 基线修订号 / 暂存操作数 / 提交结果摘要；附当前 `draftRevisionNo`）
-- `GET  /api/editor/sessions/:id` — 会话详情：基线快照、暂存操作列表、会话工作稿（基线 + 操作折叠）、提交结果；不存在 404
+- `POST /api/editor/sessions` — 开启并行编辑会话；体含 `editor`、`note`。记录当时**草稿修订号**、草稿身份代次 `baseRestoreEpoch` 与事件 / 主张 / 关系快照（基线，只读）
+  - 201：`{session:{sessionId, status:"open", baseRevisionNo, currentRevisionNo, baseRestoreEpoch, currentRestoreEpoch, openedAt, baseline:{events,relations,counts}, ops:[], working, result:null}}`
+- `GET  /api/editor/sessions` — 会话列表（状态 / 基线修订号 / 身份代次 / 暂存操作数 / 提交结果摘要；附当前 `draftRevisionNo` 与 `draftRestoreEpoch`；每项附 `baseRestoreEpoch`、`currentRestoreEpoch` 与 `restoreCrossed`：基线是否已跨越恢复）
+- `GET  /api/editor/sessions/:id` — 会话详情：基线快照、暂存操作列表、会话工作稿（基线 + 操作折叠）、提交结果、`baseRestoreEpoch` / `currentRestoreEpoch`；不存在 404
 - `POST /api/editor/sessions/:id/ops` — 暂存一批操作；体含 `ops:[...]`（`create_event`/`update_event`/`delete_event`/`create_claim`/`update_claim`/`delete_claim`/`create_relation`/`update_relation`/`delete_relation`；新对象以 `tempId` 标记并用 `eventRef`/`earlierRef`/`laterRef`/`claimRef` 等引用，基线对象用正式 id）
   - 201：`{staged, opCount, working}`（工作稿预览；草稿尚未变化，修订号不推进）
   - 422：`{code:"SESSION_OPS_INVALID", problems:[{opIndex, message}]}`（日期 / 出处 / 关系校验与现有录入一致，整批拒绝不落半截）；ops 非数组或为空 400；会话已关闭 409 `SESSION_NOT_OPEN`
-- `POST /api/editor/sessions/:id/commit` — 提交会话：三方合并（基线 / 当前草稿 / 会话工作稿）
-  - 200：`{alreadyCommitted:false, revisionNo, idMap:{events:[{tempId,eventId}],claims:[{tempId,claimId,eventId}],relations:[{tempId,relationId}]}, applied:{...}, autoMerged:[{objectType,id,sessionFields,otherFields}]}`（一个事务原子应用，修订号只推进一次）；**重复提交幂等**：200 且 `alreadyCommitted:true`，返回首次结果、不重复写入
-  - 409：`{code:"SESSION_MERGE_CONFLICT", currentRevisionNo, conflicts:[{type:"field_conflict"|"edit_delete"|"endpoint_deleted", objectType, id/tempId, message, fields?:[{field,baseline,current,proposed}], baseline, current, proposed}]}`（整次拒绝、逐项列出三方值，草稿未动；重复提交同样 409 且 `alreadyConflicted:true`）；冲突后须重开会话
+- `POST /api/editor/sessions/:id/commit` — 提交会话：三方合并（基线 / 当前草稿 / 会话工作稿）；先核对身份代次，再做三方合并
+  - 200：`{alreadyCommitted:false, revisionNo, idMap:{events:[{tempId,eventId}],claims:[{tempId,claimId,eventId}],relations:[{tempId,relationId}]}, applied:{...}, autoMerged:[{objectType,id,sessionFields,otherFields}], restoreEpoch}`（一个事务原子应用，修订号只推进一次）；**重复提交幂等**：200 且 `alreadyCommitted:true`，返回首次结果、不重复写入
+  - 409：`{code:"SESSION_MERGE_CONFLICT", currentRevisionNo, baseRestoreEpoch, currentRestoreEpoch, conflicts:[{type, objectType, id/tempId, message, ...}]}`（整次拒绝、逐项列出三方值，草稿未动；重复提交同样 409 且 `alreadyConflicted:true`）；冲突后须重开会话。冲突项 `type` 取值：
+    - `"field_conflict"`：同字段异值，`fields:[{field,baseline,current,proposed}]`，附 `baseline/current/proposed`
+    - `"edit_delete"`：编辑与删除相撞，附 `sessionAction`、`blockers?` 与三方值
+    - `"endpoint_deleted"`：会话新增关系 / 主张的端点事件已被删除
+    - `"identity_replaced"`：会话开启后草稿被从版本恢复整体重建（编号谱系已断），附 `reason:"draft_restored"`、`baseRestoreEpoch`、`currentRestoreEpoch`、`restoredFromVersionNo`；恢复返回的旧→新 `idMap` 可用于重开会话后核对编号

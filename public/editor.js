@@ -1163,12 +1163,13 @@ function renderSessionList(sessions) {
       <div class="row" style="align-items:center">
         <strong>会话 #${s.sessionId}</strong>
         <span class="badge" style="${SESSION_STATUS_STYLE[s.status] || ''}">${SESSION_STATUS_LABEL[s.status] || s.status}</span>
-        <span class="muted" style="flex:1">${esc(s.editor || '匿名')} · 基线修订号 ${s.baseRevisionNo} · 暂存操作 ${s.opCount} 条 ·
+        ${s.restoreCrossed ? '<span class="badge" style="background:#fbeaea;color:#a33">已跨越恢复</span>' : ''}
+        <span class="muted" style="flex:1">${esc(s.editor || '匿名')} · 基线修订号 ${s.baseRevisionNo} · 身份代次 ${s.baseRestoreEpoch} · 暂存操作 ${s.opCount} 条 ·
           开启于 ${esc(s.openedAt)} UTC${s.closedAt ? ` · 关闭于 ${esc(s.closedAt)} UTC` : ''}</span>
         <button class="secondary" type="button" data-view-session="${s.sessionId}" style="padding:2px 10px;font-size:13px">查看会话</button>
       </div>
       ${s.status === 'committed' ? `<div class="muted">已提交：新草稿修订号 ${s.revisionNo}。</div>` : ''}
-      ${s.status === 'conflicted' ? `<div class="muted" style="color:#a33">提交因 ${s.conflictCount} 处冲突被拒绝，草稿未改动；请基于最新草稿重开会话。</div>` : ''}
+      ${s.status === 'conflicted' ? `<div class="muted" style="color:#a33">提交因 ${s.conflictCount} 处冲突被拒绝，草稿未改动；${s.restoreCrossed ? '基线已跨越「从版本恢复」、对象编号可能已易主，' : ''}请基于最新草稿重开会话。</div>` : ''}
     </div>`).join('');
 }
 
@@ -1257,8 +1258,9 @@ function sessionConflictItemHtml(c) {
     field_conflict: '同一字段双方不同值',
     edit_delete: '编辑与删除相撞',
     endpoint_deleted: '关系端点已删除',
+    identity_replaced: '恢复后对象身份更替',
   }[c.type] || c.type;
-  const objLabel = { event: '事件', claim: '主张', relation: '「先于」关系' }[c.objectType] || c.objectType;
+  const objLabel = { event: '事件', claim: '主张', relation: '「先于」关系', draft: '草稿整体' }[c.objectType] || c.objectType;
   let table;
   if (c.type === 'field_conflict' && Array.isArray(c.fields)) {
     table = `
@@ -1286,6 +1288,17 @@ function sessionConflictItemHtml(c) {
   const blockers = Array.isArray(c.blockers) && c.blockers.length
     ? `<div class="muted">对方新增的内容：${c.blockers.map((b) => esc(JSON.stringify(b))).join('；')}</div>`
     : '';
+  if (c.type === 'identity_replaced') {
+    return `
+    <div class="rel-line">
+      <span class="badge" style="background:#fbeaea;color:#a33">${esc(typeLabel)}</span>
+      <strong>${esc(objLabel)}</strong>
+      <div>${esc(c.message)}</div>
+      <div class="muted">基线身份代次 ${esc(fmtVal(c.baseRestoreEpoch))} → 当前 ${esc(fmtVal(c.currentRestoreEpoch))}${
+        c.restoredFromVersionNo != null ? `；最近恢复自第 ${esc(fmtVal(c.restoredFromVersionNo))} 版` : ''
+      }。本会话已关闭、草稿未改动；请对照恢复时返回的旧→新编号映射，基于当前草稿重开会话。</div>
+    </div>`;
+  }
   return `
     <div class="rel-line">
       <span class="badge" style="background:#fbeaea;color:#a33">${esc(typeLabel)}</span>
@@ -1354,7 +1367,8 @@ function renderSessionDetail() {
         <strong>会话 #${s.sessionId}</strong>
         ${statusBadge}
         <span class="muted" style="flex:1">${esc(s.editor || '匿名')} · 基线修订号 ${s.baseRevisionNo} ·
-          当前草稿修订号 ${s.currentRevisionNo} · 开启于 ${esc(s.openedAt)} UTC</span>
+          当前草稿修订号 ${s.currentRevisionNo} · 身份代次 ${s.baseRestoreEpoch} → ${s.currentRestoreEpoch} ·
+          开启于 ${esc(s.openedAt)} UTC</span>
         <button class="secondary" type="button" id="btnSessionClose" style="padding:2px 10px;font-size:13px">收起</button>
       </div>
       <div style="margin-top:8px">${body}</div>

@@ -39,7 +39,7 @@ beforeEach(() => {
     DELETE FROM claims;
     DELETE FROM events;
     DELETE FROM sqlite_sequence;
-    UPDATE draft_meta SET revision = 0;
+    UPDATE draft_meta SET revision = 0, restore_epoch = 0, last_restore_version_no = NULL;
   `);
 });
 
@@ -96,6 +96,25 @@ async function commit(sessionId, expect = 200) {
   const r = await call('POST', `/api/editor/sessions/${sessionId}/commit`);
   assert.strictEqual(r.status, expect, JSON.stringify(r.json));
   return r.json;
+}
+
+// 发布当前草稿（每事件取其唯一 / 指定主张），再从该版恢复草稿；返回恢复响应。
+async function publishAndRestore(selection) {
+  const pub = await call('POST', '/api/editor/publish', {
+    body: { selection, baseVersionNo: 0, editor: '乙', note: '恢复用版本' },
+  });
+  assert.strictEqual(pub.status, 201, JSON.stringify(pub.json));
+  const pv = await call('GET', `/api/editor/restore-preview/${pub.json.versionNo}`);
+  assert.strictEqual(pv.status, 200, JSON.stringify(pv.json));
+  const restored = await call('POST', '/api/editor/restore', {
+    body: {
+      versionNo: pub.json.versionNo,
+      draftRevisionNo: pv.json.draftRevisionNo,
+      currentVersionNo: pv.json.currentVersionNo,
+    },
+  });
+  assert.strictEqual(restored.status, 200, JSON.stringify(restored.json));
+  return restored.json;
 }
 
 // ---------- 口令与可见性 ----------
@@ -467,6 +486,192 @@ test('会话修改的主张被对方删除 → 编辑与删除相撞', async () 
   assert.strictEqual(r.json.conflicts[0].objectType, 'claim');
   assert.strictEqual(r.json.conflicts[0].baseline.source, '原始出处');
   assert.strictEqual(r.json.conflicts[0].proposed.source, '会话改的出处');
+});
+
+// ---------- 恢复造成的对象身份更替（跨恢复提交整次拒绝） ----------
+
+test('会话开启后草稿被从版本恢复：旧会话提交返回 identity_replaced 冲突，草稿不动且幂等', async () => {
+  // 底稿：事件 A(#1)，甲在旧会话里只改 A 的描述
+  const aId = await makeEvent('事件A', 'A 的原描述');
+  const aClaim = await makeClaim(aId, { precision: 'year', year: 1958, source: '李宝山口述' });
+  const s = await openSession('甲');
+  assert.strictEqual(s.baseRestoreEpoch, 0);
+  assert.strictEqual(s.currentRestoreEpoch, 0);
+  await stageOps(s.sessionId, [{ op: 'update_event', eventId: aId, description: '甲改的 A 描述' }]);
+
+  // 另一编辑者：删除 A、另建事件 B（#1），发布并从该版恢复草稿 → B 重新占用编号 1
+  await call('DELETE', `/api/editor/events/${aId}`);
+  const bId = await makeEvent('事件B', 'B 的描述');
+  const bClaim = await makeClaim(bId, { precision: 'year', year: 1959, source: '王秀兰口述' });
+  const restored = await publishAndRestore([{ eventId: bId, claimId: bClaim }]);
+  const newB = restored.idMap.events[0].newEventId;
+  assert.strictEqual(newB, 1); // 恢复后编号从 1 重新分配，B 占用了旧 A 的编号
+  assert.strictEqual(restored.revisionNo, (await getState()).draftRevisionNo);
+
+  // 旧会话提交：不得把 A 的描述写进 B，须整次拒绝
+  const r = await call('POST', `/api/editor/sessions/${s.sessionId}/commit`);
+  assert.strictEqual(r.status, 409, JSON.stringify(r.json));
+  assert.strictEqual(r.json.code, 'SESSION_MERGE_CONFLICT');
+  assert.strictEqual(r.json.conflicts.length, 1);
+  const c = r.json.conflicts[0];
+  assert.strictEqual(c.type, 'identity_replaced');
+  assert.strictEqual(c.reason, 'draft_restored');
+  assert.strictEqual(c.baseRestoreEpoch, 0);
+  assert.strictEqual(c.currentRestoreEpoch, 1);
+  assert.strictEqual(c.restoredFromVersionNo, 1);
+  assert.ok(c.message.includes('恢复'));
+
+  // 草稿一字未动：#1 仍是 B，描述没有被写成 A 的
+  const st = await getState();
+  assert.strictEqual(st.draftRestoreEpoch, 1);
+  assert.strictEqual(st.events.length, 1);
+  assert.strictEqual(st.events[0].id, 1);
+  assert.strictEqual(st.events[0].title, '事件B');
+  assert.strictEqual(st.events[0].description, 'B 的描述');
+  assert.ok(!st.events.some((e) => e.description === '甲改的 A 描述'));
+
+  // 会话已关闭；重复提交返回首次冲突结果，草稿仍不动（幂等）
+  const again = await call('POST', `/api/editor/sessions/${s.sessionId}/commit`);
+  assert.strictEqual(again.status, 409);
+  assert.strictEqual(again.json.alreadyConflicted, true);
+  assert.strictEqual(again.json.conflicts[0].type, 'identity_replaced');
+  const st2 = await getState();
+  assert.strictEqual(st2.events[0].description, 'B 的描述');
+  assert.strictEqual(st2.draftRevisionNo, st.draftRevisionNo);
+
+  // 已关闭会话不能再暂存
+  const ops = await call('POST', `/api/editor/sessions/${s.sessionId}/ops`, {
+    body: { ops: [{ op: 'update_event', eventId: 1, description: 'x' }] },
+  });
+  assert.strictEqual(ops.status, 409);
+  assert.strictEqual(ops.json.code, 'SESSION_NOT_OPEN');
+});
+
+test('身份代次跨多次恢复仍可辨认；会话详情与列表暴露代次与 restoreCrossed', async () => {
+  const e1 = await makeEvent('事件A');
+  const c1 = await makeClaim(e1, { precision: 'year', year: 1958, source: '出处一' });
+  const s = await openSession('甲');
+  await stageOps(s.sessionId, [{ op: 'update_event', eventId: e1, title: '甲改A' }]);
+
+  // 第一次恢复（A 仍在版中，编号恰好不变，但代次已推进）
+  await publishAndRestore([{ eventId: e1, claimId: c1 }]);
+  // 恢复后草稿仍可继续编辑并再发布、再恢复：第二次恢复
+  const e2 = await makeEvent('事件C');
+  const c2 = await makeClaim(e2, { precision: 'year', year: 1960, source: '出处二' });
+  const stateBefore = await getState();
+  const pub2 = await call('POST', '/api/editor/publish', {
+    // 第二次发布须以当前最新版本号 1 为基准
+    body: {
+      selection: [
+        { eventId: 1, claimId: 1 },
+        { eventId: e2, claimId: c2 },
+      ],
+      baseVersionNo: stateBefore.currentVersionNo,
+      editor: '乙',
+    },
+  });
+  assert.strictEqual(pub2.status, 201, JSON.stringify(pub2.json));
+  const pv2 = await call('GET', `/api/editor/restore-preview/${pub2.json.versionNo}`);
+  const restored2 = await call('POST', '/api/editor/restore', {
+    body: {
+      versionNo: pub2.json.versionNo,
+      draftRevisionNo: pv2.json.draftRevisionNo,
+      currentVersionNo: pv2.json.currentVersionNo,
+    },
+  });
+  assert.strictEqual(restored2.status, 200, JSON.stringify(restored2.json));
+
+  const r = await call('POST', `/api/editor/sessions/${s.sessionId}/commit`);
+  assert.strictEqual(r.status, 409);
+  const c = r.json.conflicts[0];
+  assert.strictEqual(c.type, 'identity_replaced');
+  assert.strictEqual(c.baseRestoreEpoch, 0);
+  assert.strictEqual(c.currentRestoreEpoch, 2);
+  assert.strictEqual(c.restoredFromVersionNo, 2);
+
+  // 会话详情与列表
+  const detail = await call('GET', `/api/editor/sessions/${s.sessionId}`);
+  assert.strictEqual(detail.json.session.baseRestoreEpoch, 0);
+  assert.strictEqual(detail.json.session.currentRestoreEpoch, 2);
+  assert.strictEqual(detail.json.session.status, 'conflicted');
+  const list = await call('GET', '/api/editor/sessions');
+  assert.strictEqual(list.json.draftRestoreEpoch, 2);
+  const item = list.json.sessions.find((x) => x.sessionId === s.sessionId);
+  assert.strictEqual(item.baseRestoreEpoch, 0);
+  assert.strictEqual(item.currentRestoreEpoch, 2);
+  assert.strictEqual(item.restoreCrossed, true);
+  assert.strictEqual(item.conflictCount, 1);
+});
+
+test('恢复后基于最新草稿重开会话：新会话同代次，普通三方合并照常自动合并', async () => {
+  // 旧会话跨恢复被拒
+  const aId = await makeEvent('事件A', 'A 描述');
+  const aClaim = await makeClaim(aId, { precision: 'year', year: 1958, source: '出处A' });
+  const old = await openSession('甲');
+  await stageOps(old.sessionId, [{ op: 'update_event', eventId: aId, description: '旧会话改的' }]);
+  await call('DELETE', `/api/editor/events/${aId}`);
+  const bId = await makeEvent('事件B', 'B 描述');
+  const bClaim = await makeClaim(bId, { precision: 'year', year: 1959, source: '出处B' });
+  await publishAndRestore([{ eventId: bId, claimId: bClaim }]);
+  assert.strictEqual((await call('POST', `/api/editor/sessions/${old.sessionId}/commit`)).status, 409);
+
+  // 恢复后重开会话：基线代次 = 当前代次
+  const s2 = await openSession('甲（重开）');
+  assert.strictEqual(s2.baseRestoreEpoch, 1);
+  assert.strictEqual(s2.currentRestoreEpoch, 1);
+  assert.strictEqual(s2.baseline.events[0].id, 1);
+  assert.strictEqual(s2.baseline.events[0].title, '事件B');
+
+  // 普通并行编辑：会话改描述，对方改标题 → 不同字段自动合并（既有规则不变）
+  await stageOps(s2.sessionId, [{ op: 'update_event', eventId: 1, description: '甲在B上改的描述' }]);
+  await call('PUT', '/api/editor/events/1', { body: { title: '事件B（乙改标题）', description: 'B 描述' } });
+  const ok = await commit(s2.sessionId);
+  const am = ok.autoMerged.find((m) => m.objectType === 'event' && m.id === 1);
+  assert.deepStrictEqual(am.sessionFields, ['description']);
+  assert.deepStrictEqual(am.otherFields, ['title']);
+  const st = await getState();
+  assert.strictEqual(st.events[0].title, '事件B（乙改标题）');
+  assert.strictEqual(st.events[0].description, '甲在B上改的描述');
+  assert.strictEqual(st.draftRestoreEpoch, 1); // 普通编辑不推进代次
+});
+
+test('恢复后重开的会话，普通同字段异值与编辑删除相撞仍按既有规则整次拒绝', async () => {
+  const bId = await makeEvent('事件B', 'B 描述');
+  const bClaim = await makeClaim(bId, { precision: 'year', year: 1959, source: '出处B' });
+  await publishAndRestore([{ eventId: bId, claimId: bClaim }]); // 代次推进到 1
+
+  // 同字段异值
+  const s1 = await openSession('甲');
+  await stageOps(s1.sessionId, [{ op: 'update_event', eventId: 1, title: '甲的标题' }]);
+  await call('PUT', '/api/editor/events/1', { body: { title: '乙的标题', description: 'B 描述' } });
+  const r1 = await call('POST', `/api/editor/sessions/${s1.sessionId}/commit`);
+  assert.strictEqual(r1.status, 409);
+  assert.strictEqual(r1.json.conflicts[0].type, 'field_conflict');
+
+  // 编辑删除相撞：会话删除，对方修改
+  const s2 = await openSession('甲');
+  await stageOps(s2.sessionId, [{ op: 'delete_event', eventId: 1 }]);
+  await call('PUT', '/api/editor/events/1', { body: { title: '乙又改的标题', description: 'B 描述' } });
+  const r2 = await call('POST', `/api/editor/sessions/${s2.sessionId}/commit`);
+  assert.strictEqual(r2.status, 409);
+  assert.strictEqual(r2.json.conflicts[0].type, 'edit_delete');
+  assert.ok((await getState()).events.some((e) => e.id === 1)); // 整次拒绝，未删除
+});
+
+test('未经历恢复的普通并行编辑：代次始终为 0，既有自动合并行为不变', async () => {
+  const e1 = await makeEvent('事件一', '原始描述');
+  const s = await openSession();
+  assert.strictEqual(s.baseRestoreEpoch, 0);
+  await stageOps(s.sessionId, [{ op: 'update_event', eventId: e1, description: '甲改的描述' }]);
+  await call('PUT', `/api/editor/events/${e1}`, { body: { title: '乙改的标题', description: '原始描述' } });
+  const ok = await commit(s.sessionId);
+  assert.strictEqual(ok.restoreEpoch, 0);
+  const st = await getState();
+  assert.strictEqual(st.events.find((e) => e.id === e1).title, '乙改的标题');
+  assert.strictEqual(st.events.find((e) => e.id === e1).description, '甲改的描述');
+  // 列表项 restoreCrossed 为 false
+  const list = await call('GET', '/api/editor/sessions');
+  assert.strictEqual(list.json.sessions.find((x) => x.sessionId === s.sessionId).restoreCrossed, false);
 });
 
 // ---------- 冲突后重开会话 ----------

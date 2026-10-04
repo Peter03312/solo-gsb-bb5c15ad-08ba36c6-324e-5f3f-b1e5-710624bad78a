@@ -4,7 +4,7 @@ const express = require('express');
 const { getDb } = require('./db');
 const { parseClaimDate, claimInterval, formatClaimDate } = require('./dates');
 const { evaluateDraft, publishVersion, latestVersionNo, getVersionDetail, getVersionSummary } = require('./publish');
-const { buildRestorePreview, restoreDraftFromVersion, draftRevisionNo } = require('./restore');
+const { buildRestorePreview, restoreDraftFromVersion, draftRevisionNo, draftRestoreEpoch } = require('./restore');
 const { buildImportPreview, confirmImport } = require('./bundle');
 const {
   previewSourceRedaction,
@@ -207,6 +207,7 @@ router.get('/api/editor/state', (req, res) => {
     latestVisibleVersionNo: latestVisibleVersionNo(),
     currentVersion: getVersionSummary(latestVersionNo()) || null,
     draftRevisionNo: draftRevisionNo(),
+    draftRestoreEpoch: draftRestoreEpoch(),
     events,
     relations,
   });
@@ -641,9 +642,9 @@ router.post('/api/editor/sessions', (req, res) => {
   res.status(201).json({ ok: true, session });
 });
 
-// 会话列表（状态 / 基线修订号 / 操作数 / 结果摘要）
+// 会话列表（状态 / 基线修订号 / 身份代次 / 操作数 / 结果摘要）
 router.get('/api/editor/sessions', (req, res) => {
-  res.json({ draftRevisionNo: draftRevisionNo(), sessions: listSessions() });
+  res.json({ draftRevisionNo: draftRevisionNo(), draftRestoreEpoch: draftRestoreEpoch(), sessions: listSessions() });
 });
 
 // 会话详情：基线快照、暂存操作、会话工作稿（基线+操作折叠）、提交结果

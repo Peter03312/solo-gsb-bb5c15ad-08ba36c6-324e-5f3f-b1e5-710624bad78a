@@ -50,9 +50,17 @@ CREATE INDEX IF NOT EXISTS idx_rel_later ON relations(later_id);
 -- ============ 草稿修订号（恢复草稿时的乐观并发控制） ============
 -- 草稿区 events/claims/relations 的任何增删改都由触发器推进 revision；
 -- 「预览恢复」与「确认恢复」之间草稿若被改过，确认即报冲突、不改数据。
+--
+-- restore_epoch：草稿「身份代次」。普通增删改不动它；只有「从已发布版本恢复草稿」
+-- 会清空并重建整个草稿区、重置自增序号（编号可能从 1 重新分配给完全不同的对象），
+-- 每次恢复把 restore_epoch + 1。跨恢复存活的旧会话基线编号不再保证与当前草稿编号
+-- 指向同一对象（旧 #1 可能已被删除，恢复后的 #1 是另一个事件），提交时据此整次拒绝。
+-- last_restore_version_no：最近一次恢复所据的已发布版本号（仅溯源，未恢复过为 NULL）。
 CREATE TABLE IF NOT EXISTS draft_meta (
   id       INTEGER PRIMARY KEY CHECK (id = 1),
-  revision INTEGER NOT NULL DEFAULT 0
+  revision INTEGER NOT NULL DEFAULT 0,
+  restore_epoch INTEGER NOT NULL DEFAULT 0,
+  last_restore_version_no INTEGER
 );
 INSERT OR IGNORE INTO draft_meta (id, revision) VALUES (1, 0);
 
@@ -242,12 +250,14 @@ CREATE TABLE IF NOT EXISTS errata (
 CREATE INDEX IF NOT EXISTS idx_errata_target ON errata(version_no, target_type, target_id);
 
 -- ============ 并行编辑会话（暂存修改，提交时三方合并） ============
--- 两名编辑者同时整理草稿时各自开启会话：开启时把当时的草稿修订号与
+-- 两名编辑者同时整理草稿时各自开启会话：开启时把当时的草稿修订号、草稿身份代次与
 -- 全部事件 / 主张 / 「先于」关系快照存入 baseline_json（基线，只读不变）；
 -- 会话内的修改先写入 edit_session_ops 暂存（不直接改草稿，草稿也不加锁）。
 -- 提交时对照「基线」「当前草稿」「会话工作稿（基线+暂存操作）」做三方合并：
 -- 彼此未触及的对象 / 字段自动合并；同一字段被双方改成不同值、编辑与删除相撞、
 -- 关系端点已删除时整次拒绝（409），逐项列出基线 / 当前值 / 拟提交值。
+-- 若会话开启后草稿被「从版本恢复」整体重建（restore_epoch 推进、旧编号可能易主），
+-- 按编号对齐的三方合并失去前提，同样整次拒绝（409，identity_replaced 冲突）。
 -- 成功提交在一个事务内应用全部变更（草稿修订号只推进一次），返回新修订号与
 -- 临时编号 → 正式编号映射；会话随即关闭（committed / conflicted 均为终态），
 -- 重复提交返回首次结果、绝不重复写入；冲突后须基于最新草稿重开会话。
@@ -257,6 +267,7 @@ CREATE TABLE IF NOT EXISTS edit_sessions (
   editor           TEXT NOT NULL DEFAULT '',
   note             TEXT NOT NULL DEFAULT '',
   base_revision_no INTEGER NOT NULL,                    -- 开启时的草稿修订号
+  base_restore_epoch INTEGER NOT NULL DEFAULT 0,        -- 开启时的草稿身份代次（跨恢复提交即冲突）
   baseline_json    TEXT NOT NULL,                       -- 开启时的草稿快照（事件/主张/关系）
   status           TEXT NOT NULL DEFAULT 'open'
                      CHECK (status IN ('open','committed','conflicted')),
@@ -278,6 +289,25 @@ CREATE INDEX IF NOT EXISTS idx_session_ops_session ON edit_session_ops(session_i
 
 let db;
 
+// 已建库的轻量迁移：CREATE TABLE IF NOT EXISTS 不会给老表补列，这里按列名探测后
+// 幂等 ALTER。新增列都有默认值 / 可空，老数据（身份代次 0 = 从未恢复）语义不变。
+function migrate(instance) {
+  const columnsOf = (table) => new Set(instance.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
+
+  const metaCols = columnsOf('draft_meta');
+  if (!metaCols.has('restore_epoch')) {
+    instance.exec('ALTER TABLE draft_meta ADD COLUMN restore_epoch INTEGER NOT NULL DEFAULT 0');
+  }
+  if (!metaCols.has('last_restore_version_no')) {
+    instance.exec('ALTER TABLE draft_meta ADD COLUMN last_restore_version_no INTEGER');
+  }
+
+  const sessionCols = columnsOf('edit_sessions');
+  if (!sessionCols.has('base_restore_epoch')) {
+    instance.exec('ALTER TABLE edit_sessions ADD COLUMN base_restore_epoch INTEGER NOT NULL DEFAULT 0');
+  }
+}
+
 function getDb() {
   if (db) return db;
   const dbPath = process.env.DB_PATH || path.join(__dirname, '..', 'data', 'chronicle.db');
@@ -286,6 +316,7 @@ function getDb() {
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
   db.exec(SCHEMA);
+  migrate(db);
   return db;
 }
 

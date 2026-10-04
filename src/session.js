@@ -15,6 +15,10 @@
 //   · 同一字段被双方改成不同值、编辑与删除相撞（含删除会级联丢弃对方新增内容）、
 //     关系端点已被对方删除：整次拒绝（409 SESSION_MERGE_CONFLICT），逐项列出
 //     基线 / 当前值 / 拟提交值供人工重编，草稿一字未动；
+//   · 会话开启后草稿被「从版本恢复」整体重建（身份代次 restore_epoch 推进）：
+//     恢复会清空草稿、重置自增序号，旧编号可能重新分配给完全不同的对象
+//     （旧 #1 已删，恢复后的 #1 是另一事件），按编号对齐的三方合并不再有意义——
+//     同样整次拒绝（409，冲突项 type 为 identity_replaced），草稿一字未动；
 //   · 无冲突：在一个事务内应用全部变更（草稿修订号只推进一次），返回新修订号
 //     与临时编号 → 正式编号映射。
 // 提交幂等：会话一旦 committed / conflicted 即关闭，重复提交返回首次结果，
@@ -23,7 +27,7 @@
 
 const { getDb } = require('./db');
 const { parseClaimDate, claimInterval, formatClaimDate } = require('./dates');
-const { draftRevisionNo } = require('./restore');
+const { draftRevisionNo, draftRestoreEpoch } = require('./restore');
 
 const EVENT_FIELDS = ['title', 'description'];
 const CLAIM_FIELDS = ['precision', 'year', 'month', 'day', 'source', 'note'];
@@ -808,14 +812,17 @@ function getSessionRow(sessionId) {
   return getDb().prepare('SELECT * FROM edit_sessions WHERE id = ?').get(sessionId);
 }
 
-// 开启会话：记录当前草稿修订号与完整草稿快照（基线，只读）。
+// 开启会话：记录当前草稿修订号、草稿身份代次与完整草稿快照（基线，只读）。
 function openSession({ editor, note }) {
   const db = getDb();
   const baseline = readDraftState();
   const baseRevisionNo = draftRevisionNo();
+  const baseRestoreEpoch = draftRestoreEpoch();
   const info = db
-    .prepare('INSERT INTO edit_sessions (editor, note, base_revision_no, baseline_json) VALUES (?, ?, ?, ?)')
-    .run(String(editor || ''), String(note || ''), baseRevisionNo, JSON.stringify(baseline));
+    .prepare(
+      'INSERT INTO edit_sessions (editor, note, base_revision_no, base_restore_epoch, baseline_json) VALUES (?, ?, ?, ?, ?)'
+    )
+    .run(String(editor || ''), String(note || ''), baseRevisionNo, baseRestoreEpoch, JSON.stringify(baseline));
   return getSession(info.lastInsertRowid);
 }
 
@@ -832,6 +839,8 @@ function getSession(sessionId) {
     status: row.status,
     baseRevisionNo: row.base_revision_no,
     currentRevisionNo: draftRevisionNo(),
+    baseRestoreEpoch: row.base_restore_epoch,
+    currentRestoreEpoch: draftRestoreEpoch(),
     openedAt: row.created_at,
     closedAt: row.closed_at,
     baseline: shapeState(workingFromState(baseline)),
@@ -845,7 +854,9 @@ function listSessions() {
   return getDb()
     .prepare(
       `SELECT s.id AS sessionId, s.editor, s.note, s.status,
-              s.base_revision_no AS baseRevisionNo, s.created_at AS openedAt, s.closed_at AS closedAt,
+              s.base_revision_no AS baseRevisionNo,
+              s.base_restore_epoch AS baseRestoreEpoch,
+              s.created_at AS openedAt, s.closed_at AS closedAt,
               (SELECT COUNT(*) FROM edit_session_ops o WHERE o.session_id = s.id) AS opCount,
               s.result_json AS resultJson
          FROM edit_sessions s ORDER BY s.id DESC`
@@ -859,6 +870,9 @@ function listSessions() {
         note: r.note,
         status: r.status,
         baseRevisionNo: r.baseRevisionNo,
+        baseRestoreEpoch: r.baseRestoreEpoch,
+        currentRestoreEpoch: draftRestoreEpoch(),
+        restoreCrossed: r.baseRestoreEpoch !== draftRestoreEpoch(),
         opCount: r.opCount,
         openedAt: r.openedAt,
         closedAt: r.closedAt,
@@ -918,6 +932,26 @@ function appendSessionOps(sessionId, rawOps) {
   };
 }
 
+// ---------- 恢复造成的对象身份更替 ----------
+// 会话开启后草稿被「从版本恢复」整体重建：旧编号可能已易主（恢复重置自增序号，
+// 编号从 1 重新分配），基线 / 当前 / 工作稿无法再按编号对齐成同一对象。
+// 此时不进入三方合并，整次拒绝，草稿一字不动。
+function buildRestoreConflict({ baseEpoch, currentEpoch, lastRestoreVersionNo }) {
+  return {
+    type: 'identity_replaced',
+    reason: 'draft_restored',
+    objectType: 'draft',
+    message:
+      `草稿在会话开启后被「从已发布版本恢复」整体重建（身份代次 ${baseEpoch} → ${currentEpoch}` +
+      `${lastRestoreVersionNo == null ? '' : `，最近恢复自第 ${lastRestoreVersionNo} 版`}）：` +
+      `恢复会清空草稿并把编号从 1 重新分配，会话基线里的事件 / 主张 / 关系编号可能已指向另一个对象，` +
+      `三方合并按编号对齐不再安全。请基于恢复后的最新草稿重开会话，核对编号映射后重新暂存。`,
+    baseRestoreEpoch: baseEpoch,
+    currentRestoreEpoch: currentEpoch,
+    restoredFromVersionNo: lastRestoreVersionNo == null ? null : lastRestoreVersionNo,
+  };
+}
+
 // 提交会话：三方合并 → 无冲突则一个事务应用全部变更；有冲突整次拒绝并逐项列出。
 // 幂等：会话关闭后重复提交返回首次结果，绝不重复写入。
 function commitSession(sessionId) {
@@ -943,6 +977,39 @@ function commitSession(sessionId) {
 
   const baseline = JSON.parse(row.baseline_json);
   const ops = loadOps(sessionId);
+  const meta = db.prepare('SELECT revision, restore_epoch, last_restore_version_no FROM draft_meta WHERE id = 1').get();
+
+  // 身份代次检查：会话开启后草稿若被「从版本恢复」整体重建，编号谱系已断，
+  // 不做三方合并，整次拒绝（409 identity_replaced），草稿一字未动。
+  if (meta.restore_epoch !== row.base_restore_epoch) {
+    const conflict = buildRestoreConflict({
+      baseEpoch: row.base_restore_epoch,
+      currentEpoch: meta.restore_epoch,
+      lastRestoreVersionNo: meta.last_restore_version_no,
+    });
+    const stored = {
+      baseRevisionNo: row.base_revision_no,
+      currentRevisionNo: meta.revision,
+      baseRestoreEpoch: row.base_restore_epoch,
+      currentRestoreEpoch: meta.restore_epoch,
+      conflicts: [conflict],
+    };
+    db.prepare("UPDATE edit_sessions SET status = 'conflicted', result_json = ?, closed_at = datetime('now') WHERE id = ?").run(
+      JSON.stringify(stored),
+      sessionId
+    );
+    throw {
+      status: 409,
+      code: 'SESSION_MERGE_CONFLICT',
+      sessionId,
+      message:
+        `编辑会话 #${sessionId} 提交被拒绝：草稿在会话开启后被「从已发布版本恢复」整体重建，` +
+        `会话基线中的编号可能已重新分配给其他对象（对象身份更替）。草稿未做任何改动，` +
+        `请基于恢复后的最新草稿重开会话，对照恢复返回的旧→新编号映射重新暂存。`,
+      ...stored,
+    };
+  }
+
   const proposed = foldWorking(baseline, ops);
   const current = readDraftState();
   const { plan, conflicts, autoMerged } = mergeThreeWay(baseline, current, proposed);
@@ -952,6 +1019,8 @@ function commitSession(sessionId) {
     const stored = {
       baseRevisionNo: row.base_revision_no,
       currentRevisionNo: draftRevisionNo(),
+      baseRestoreEpoch: row.base_restore_epoch,
+      currentRestoreEpoch: meta.restore_epoch,
       conflicts,
     };
     db.prepare("UPDATE edit_sessions SET status = 'conflicted', result_json = ?, closed_at = datetime('now') WHERE id = ?").run(
@@ -979,7 +1048,7 @@ function commitSession(sessionId) {
     if (totalChanges > 0) {
       db.prepare('UPDATE draft_meta SET revision = ? WHERE id = 1').run(revisionNo);
     }
-    const stored = { revisionNo, idMap, applied, autoMerged, baseRevisionNo: row.base_revision_no };
+    const stored = { revisionNo, idMap, applied, autoMerged, baseRevisionNo: row.base_revision_no, restoreEpoch: meta.restore_epoch };
     db.prepare("UPDATE edit_sessions SET status = 'committed', result_json = ?, closed_at = datetime('now') WHERE id = ?").run(
       JSON.stringify(stored),
       sessionId
